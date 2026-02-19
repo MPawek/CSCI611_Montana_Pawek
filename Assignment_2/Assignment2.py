@@ -1,3 +1,5 @@
+from unicodedata import name
+from xml.parsers.expat import model
 import torch
 import numpy as np
 
@@ -12,6 +14,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import torch.optim as optim
+# Have to define the dict out of a function so both main and the hook function can access it
+# feature_maps = {}
 
 def main ():
     # check if CUDA is available
@@ -52,6 +56,17 @@ def main ():
     # TODO, compare with optimizer ADAM 
     # optimizer = optim.Adam(model.parameters(), lr=0.001)
 
+    # Prepare hooks to capture feature maps for second part of assignment:
+#     hook_handle_1 = model.conv1.register_forward_hook(feature_hook('conv1'))
+#     hook_handle_2 = model.conv2.register_forward_hook(feature_hook('conv2'))    
+
+    # Since we are analyzing RELU's effect on the middle feature maps, have to apply it here
+#     feature_maps['conv2'] = F.relu(feature_maps['conv2'])
+
+    # Remove hooks before training to not analyze every batch
+#     hook_handle_1.remove()
+#     hook_handle_2.remove()
+
     train(model, train_loader, valid_loader, criterion, optimizer, train_on_gpu)
 
     ###########################################################
@@ -61,6 +76,18 @@ def main ():
     model.load_state_dict(torch.load('model_trained.pt'))
 
     test(model, test_loader, classes, batch_size, criterion, train_on_gpu)
+
+    # Extract feauture maps:
+    # conv1_feature_maps = self.conv1(x)
+
+    # for i in range(8):
+    #     plt.imshow(conv1_feature_maps[0, i].cpu(), cmap='gray')
+
+    # Extract feauture maps:
+    # conv2_feature_maps = self.conv2(x)
+
+    # for i in range(8):
+    #     plt.imshow(conv2_feature_maps[0, i].cpu(), cmap='gray')
 
 
 
@@ -120,6 +147,11 @@ def data_loader():
 def imshow(img):
     img = img / 2 + 0.5  # unnormalize
     plt.imshow(np.transpose(img, (1, 2, 0)))  # convert from Tensor image
+
+# def feature_hook(name):
+#    def hook(module, input, output):
+#       feature_maps[name] = output.detach()
+#    return hook
 
 def visualize_batch(train_loader, classes):
     # matplotlib inline
