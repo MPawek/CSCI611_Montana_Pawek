@@ -157,6 +157,8 @@ def data_loader():
 ######################################
 # helper function to un-normalize and display an image
 def imshow(img):
+    if isinstance(img, torch.Tensor):
+        img = img.detach().cpu().numpy()
     img = img / 2 + 0.5  # unnormalize
     plt.imshow(np.transpose(img, (1, 2, 0)))  # convert from Tensor image
 
