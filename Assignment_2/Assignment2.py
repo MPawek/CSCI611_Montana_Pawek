@@ -51,7 +51,7 @@ def main ():
     criterion = nn.CrossEntropyLoss()
 
     # specify optimizer
-    optimizer = optim.SGD(model.parameters(), lr=0.01)
+    optimizer = optim.SGD(model.parameters(), lr=0.005)
 
     # TODO, compare with optimizer ADAM 
     # optimizer = optim.Adam(model.parameters(), lr=0.001)
@@ -67,7 +67,8 @@ def main ():
 #     hook_handle_1.remove()
 #     hook_handle_2.remove()
 
-    train(model, train_loader, valid_loader, criterion, optimizer, train_on_gpu)
+    # Train model, returning training and validation losses for each epoch to plot later
+    train_losses, valid_losses, x1train, x1valid = train(model, train_loader, valid_loader, criterion, optimizer, train_on_gpu)
 
     ###########################################################
     # Load the Model with the Lowest Validation Loss and Test #
@@ -89,6 +90,17 @@ def main ():
     # for i in range(8):
     #     plt.imshow(conv2_feature_maps[0, i].cpu(), cmap='gray')
 
+    # Plot training and validation loss over all epochs
+    plt.figure(figsize=(8, 6))
+    plt.plot(train_losses, label='Training Loss')
+    plt.plot(valid_losses, label='Validation Loss')
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.title('Training and Validation Loss Curves')
+    plt.grid(True)
+    plt.legend()
+
+    plt.show()
 
 
 
@@ -232,9 +244,7 @@ class Net(nn.Module):
         # TODO: Build some linear layers (fully connected)
         # for example, fc1 and fc2  
         self.fc1 = nn.Linear(in_features=64 * 4 * 4, out_features=256)
-        self.fc2 = nn.Linear(in_features=256, out_features=128)
-        self.fc3 = nn.Linear(in_features=128, out_features=64)
-        self.fc4 = nn.Linear(in_features=64, out_features=10)
+        self.fc2 = nn.Linear(in_features=256, out_features=10)
 
         # TODO: dropout layer (p=0.25, you can adjust)
         # example self.dropout = nn.Dropout(0.25)
@@ -244,25 +254,25 @@ class Net(nn.Module):
         # add sequence of convolutional and max pooling layers
         # assume we have 3 convolutional layers defined above
         # and we do a maxpooling after each conv layer
-        x = self.pool(F.relu(self.conv1(x)))
+        # Separate the first convolutional layer so we can return the output for feauture map visualization and analysis
+        x1 = self.conv1(x)
+        x = self.pool(F.relu(x1))
         x = self.pool(F.relu(self.conv2(x)))
         x = self.pool(F.relu(self.conv3(x)))
 
         # TODO: flatten x at this point to get it ready to feed into the fully connected layer(s)
         # Can use this but need to figure out the actual value for a, b and c
         x = x.view(-1, 64 * 4 * 4)
-
-        # optional add dropout layer
-        #x = self.dropout(x)
-        x = self.dropout(x)
         
+        x = self.dropout(x)
         # add 1st hidden layer, with relu activation function
         x = F.relu(self.fc1(x))
-        # optional add dropout layer
+        # add dropout layer
         x = self.dropout(x)
         # add 2nd hidden layer, with relu activation function
         x = self.fc2(x)
-        return x
+
+        return x1, x
 
 
 
@@ -273,9 +283,13 @@ class Net(nn.Module):
 ###################################
 def train(model, train_loader, valid_loader, criterion, optimizer, train_on_gpu):
     # number of epochs to train the model, you decide the number
-    n_epochs = 15
+    n_epochs = 20
 
     valid_loss_min = np.inf # track change in validation loss
+
+    # Arrays to hold training and validation losses for each epoch
+    train_losses = []
+    valid_losses = []
 
     for epoch in range(1, n_epochs+1):
 
@@ -294,7 +308,7 @@ def train(model, train_loader, valid_loader, criterion, optimizer, train_on_gpu)
             # clear the gradients of all optimized variables
             optimizer.zero_grad()
             # forward pass: compute predicted outputs by passing inputs to the model
-            output = model(data)
+            x1train, output = model(data)
             # calculate the batch loss
             loss = criterion(output, target)
             # backward pass: compute gradient of the loss with respect to model parameters
@@ -303,7 +317,8 @@ def train(model, train_loader, valid_loader, criterion, optimizer, train_on_gpu)
             optimizer.step()
             # update training loss
             train_loss += loss.item()*data.size(0)
-            
+
+           
         ######################    
         # validate the model #
         ######################
@@ -313,7 +328,7 @@ def train(model, train_loader, valid_loader, criterion, optimizer, train_on_gpu)
             if train_on_gpu:
                 data, target = data.cuda(), target.cuda()
             # forward pass: compute predicted outputs by passing inputs to the model
-            output = model(data)
+            x1valid, output = model(data)
             # calculate the batch loss
             loss = criterion(output, target)
             # update average validation loss 
@@ -323,6 +338,10 @@ def train(model, train_loader, valid_loader, criterion, optimizer, train_on_gpu)
         train_loss = train_loss/len(train_loader.sampler)
         valid_loss = valid_loss/len(valid_loader.sampler)
             
+        # Append calculated average losses for this epoch to the arrays
+        train_losses.append(train_loss)
+        valid_losses.append(valid_loss)
+
         # print training/validation statistics 
         print('Epoch: {} \tTraining Loss: {:.6f} \tValidation Loss: {:.6f}'.format(
             epoch, train_loss, valid_loss))
@@ -335,6 +354,7 @@ def train(model, train_loader, valid_loader, criterion, optimizer, train_on_gpu)
             torch.save(model.state_dict(), 'model_trained.pt')
             valid_loss_min = valid_loss
 
+    return train_losses, valid_losses, x1train, x1valid
 
 ##############################################
 # Test the Trained Model on the Test Dataset #
@@ -352,7 +372,7 @@ def test(model, test_loader, classes, batch_size, criterion, train_on_gpu):
         if train_on_gpu:
             data, target = data.cuda(), target.cuda()
         # forward pass: compute predicted outputs by passing inputs to the model
-        output = model(data)
+        x1test, output = model(data)
         # calculate the batch loss
         loss = criterion(output, target)
         # update test loss 
@@ -398,7 +418,7 @@ def test(model, test_loader, classes, batch_size, criterion, train_on_gpu):
         images = images.cuda()
 
     # get sample outputs
-    output = model(images)
+    x1test, output = model(images)
     # convert output probabilities to predicted class
     _, preds_tensor = torch.max(output, 1)
     preds = np.squeeze(preds_tensor.numpy()) if not train_on_gpu else np.squeeze(preds_tensor.cpu().numpy())
