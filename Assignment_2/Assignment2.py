@@ -15,7 +15,8 @@ import torch.nn.functional as F
 
 import torch.optim as optim
 # Have to define the dict out of a function so both main and the hook function can access it
-# feature_maps = {}
+# Originally made a dict as I was thinking of using different convolutional layers, but decided to only use the first. Kept the dict for simplicity
+feature_maps = {}
 
 def main ():
     # check if CUDA is available
@@ -26,8 +27,11 @@ def main ():
     else:
         print('CUDA is available!  Training on GPU ...')
 
+    # Use data loader to load the CIFAR10 dataset, and visualize a batch of training data
     train_loader, valid_loader, test_loader, classes, batch_size = data_loader()
-    visualize_batch(train_loader, classes)
+    
+    # Visualize_batch used as debugging tool, but is not necessary for the model to run
+    # visualize_batch(train_loader, classes)
 
     # create a complete CNN
     model = Net()
@@ -56,19 +60,8 @@ def main ():
     # TODO, compare with optimizer ADAM 
     # optimizer = optim.Adam(model.parameters(), lr=0.001)
 
-    # Prepare hooks to capture feature maps for second part of assignment:
-#     hook_handle_1 = model.conv1.register_forward_hook(feature_hook('conv1'))
-#     hook_handle_2 = model.conv2.register_forward_hook(feature_hook('conv2'))    
-
-    # Since we are analyzing RELU's effect on the middle feature maps, have to apply it here
-#     feature_maps['conv2'] = F.relu(feature_maps['conv2'])
-
-    # Remove hooks before training to not analyze every batch
-#     hook_handle_1.remove()
-#     hook_handle_2.remove()
-
-    # Train model, returning training and validation losses for each epoch to plot later
-    train_losses, valid_losses, x1train, x1valid = train(model, train_loader, valid_loader, criterion, optimizer, train_on_gpu)
+    # Train model, returning training and validation losses for each epoch to plot later, as well as the feature maps for the last batch of training and validation data to analyze later
+    train_losses, valid_losses = train(model, train_loader, valid_loader, criterion, optimizer, train_on_gpu)
 
     ###########################################################
     # Load the Model with the Lowest Validation Loss and Test #
@@ -78,17 +71,8 @@ def main ():
 
     test(model, test_loader, classes, batch_size, criterion, train_on_gpu)
 
-    # Extract feauture maps:
-    # conv1_feature_maps = self.conv1(x)
-
-    # for i in range(8):
-    #     plt.imshow(conv1_feature_maps[0, i].cpu(), cmap='gray')
-
-    # Extract feauture maps:
-    # conv2_feature_maps = self.conv2(x)
-
-    # for i in range(8):
-    #     plt.imshow(conv2_feature_maps[0, i].cpu(), cmap='gray')
+    # Part 2 of assignment: Visualize and Analyze Feature Maps
+    get_feature_maps(model, test_loader, classes, train_on_gpu)
 
     # Plot training and validation loss over all epochs
     plt.figure(figsize=(8, 6))
@@ -102,7 +86,75 @@ def main ():
 
     plt.show()
 
+def get_feature_maps(model, test_loader, classes, train_on_gpu):
+    device = torch.device("cuda" if train_on_gpu else "cpu")
+    # Set to eval so we don't change parameters/use dropout
+    model.eval()
 
+    # Need to get 3 different classes for images
+    images_to_analyze = {}
+    for images, labels in test_loader:
+        for i in range(images.size(0)):
+            y = int(labels[i].item())
+            if y not in images_to_analyze:
+                images_to_analyze[y] = (images[i], y)
+                if len(images_to_analyze) == 3:
+                    break
+        if len(images_to_analyze) == 3:
+            break
+
+    # We only need conv1 maps for each image, so that's where we'll put the hook
+    handle = model.conv1.register_forward_hook(feature_hook('conv1'))
+
+    # We don't need gradients for visualization, so turn off for efficiency
+    torch.set_grad_enabled(False)
+
+
+    for (image_tensor, class_index) in images_to_analyze.values():
+        # Prepare single-image batch
+        x = image_tensor.unsqueeze(0).to(device)
+
+        # Forward pass triggers hook and fills feature_maps['conv1'], we don't need the output for this
+        _ = model(x)
+
+        # Apply ReLU here
+        conv1_maps = F.relu(feature_maps['conv1'])
+
+        # Got an error when I set range(8) for the loop below, have to make sure we do the minimum of total feature maps or 8
+        features = conv1_maps.shape[1]
+        n_show = min(8, features)
+
+        # Formatted plots below with ChatGPT
+        fig = plt.figure(figsize=(14, 6))
+        fig.suptitle(f"Class: {classes[y]} | Layer: conv1 | Showing {n_show} feature maps", fontsize=14)
+
+        # Original image (left)
+        ax0 = plt.subplot2grid((2, 5), (0, 0), rowspan=2)
+        imshow(image_tensor)
+        ax0.set_title("Input image")
+        ax0.axis("off")
+
+        # Feature maps (right): 2x4 grid
+        fmap_chw = conv1_maps[0].detach().cpu()
+        for ch in range(n_show):
+            r = ch // 4
+            c = (ch % 4) + 1
+            ax = plt.subplot2grid((2, 5), (r, c))
+
+            m = fmap_chw[ch].numpy()
+            # Normalize each channel to [0,1] for display
+            m = m - m.min()
+            if m.max() > 0:
+                m = m / m.max()
+
+            ax.imshow(m, cmap="gray")
+            ax.set_title(f"conv1 ch {ch}")
+            ax.axis("off")
+
+        plt.tight_layout()
+        plt.show()
+
+    handle.remove()
 
 ##################################
 # Data Loading and Preprocessing #
@@ -143,7 +195,7 @@ def data_loader():
         sampler=train_sampler, num_workers=num_workers)
     valid_loader = torch.utils.data.DataLoader(train_data, batch_size=batch_size, 
         sampler=valid_sampler, num_workers=num_workers)
-    test_loader = torch.utils.data.DataLoader(test_data, batch_size=batch_size, 
+    test_loader = torch.utils.data.DataLoader(test_data, batch_size=batch_size, shuffle=True,
         num_workers=num_workers)
 
     # specify the image classes
@@ -156,30 +208,31 @@ def data_loader():
 # Visualize a Batch of Training Data #
 ######################################
 # helper function to un-normalize and display an image
+# When using CUDA, the images are on the GPU, so we need to move them back to the CPU before converting to numpy for display
 def imshow(img):
     if isinstance(img, torch.Tensor):
         img = img.detach().cpu().numpy()
     img = img / 2 + 0.5  # unnormalize
     plt.imshow(np.transpose(img, (1, 2, 0)))  # convert from Tensor image
 
-# def feature_hook(name):
-#    def hook(module, input, output):
-#       feature_maps[name] = output.detach()
-#    return hook
+def feature_hook(name):
+    def hook(module, input, output):
+       feature_maps[name] = output.detach()
+    return hook
 
 def visualize_batch(train_loader, classes):
-    # matplotlib inline
-
     # obtain one batch of training images
     dataiter = iter(train_loader)
     #images, labels = dataiter.next() #python, torchvision version match issue
     images, labels = next(dataiter)
 
+    # move model inputs to CUDA, if GPU available
     if isinstance(images, torch.Tensor):
         images = images.cpu().numpy() # convert images to numpy for display
     if isinstance(labels, torch.Tensor):
         labels = labels.cpu().numpy() # convert labels to numpy for display
 
+    # Calculations to ensure we don't go out of bounds when using the images object
     num_images = images.shape[0]
     num_show = min(num_images, 20)
     num_columns = math.ceil(num_show / 2)
@@ -187,6 +240,7 @@ def visualize_batch(train_loader, classes):
     # plot the images in the batch, along with the corresponding labels
     fig = plt.figure(figsize=(25, 4))
     # display 20 images
+    # Ran into an out of bounds error when trying to always display all 5 images in the batch, so we have to do the math to make sure the range value is not too large
     for idx in range(num_show):
         ax = fig.add_subplot(2, num_columns, idx+1, xticks=[], yticks=[])
         imshow(images[idx])
@@ -236,6 +290,7 @@ class Net(nn.Module):
         
         # TODO: Build multiple convolutional layers (sees 32x32x3 image tensor in the first hidden layer)
         # for example, conv1, conv2 and conv3
+        # 3 Convolutional layers
         self.conv1 = nn.Conv2d(in_channels=3, out_channels=16, kernel_size=5, padding=2)
         self.conv2 = nn.Conv2d(in_channels=16, out_channels=32, kernel_size=3, padding=1)
         self.conv3 = nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3, padding=1)
@@ -245,6 +300,7 @@ class Net(nn.Module):
         
         # TODO: Build some linear layers (fully connected)
         # for example, fc1 and fc2  
+        # 2 Linear layers
         self.fc1 = nn.Linear(in_features=64 * 4 * 4, out_features=256)
         self.fc2 = nn.Linear(in_features=256, out_features=10)
 
@@ -257,15 +313,14 @@ class Net(nn.Module):
         # assume we have 3 convolutional layers defined above
         # and we do a maxpooling after each conv layer
         # Separate the first convolutional layer so we can return the output for feauture map visualization and analysis
-        x1 = self.conv1(x)
-        x = self.pool(F.relu(x1))
+        x = self.pool(F.relu(self.conv1(x)))
         x = self.pool(F.relu(self.conv2(x)))
         x = self.pool(F.relu(self.conv3(x)))
 
         # TODO: flatten x at this point to get it ready to feed into the fully connected layer(s)
-        # Can use this but need to figure out the actual value for a, b and c
         x = x.view(-1, 64 * 4 * 4)
         
+        # dropout layer
         x = self.dropout(x)
         # add 1st hidden layer, with relu activation function
         x = F.relu(self.fc1(x))
@@ -274,7 +329,8 @@ class Net(nn.Module):
         # add 2nd hidden layer, with relu activation function
         x = self.fc2(x)
 
-        return x1, x
+        # Return x1 for visualization and analysis of the feature maps after the first convolutional layer, and x for the final output
+        return x
 
 
 
@@ -310,7 +366,7 @@ def train(model, train_loader, valid_loader, criterion, optimizer, train_on_gpu)
             # clear the gradients of all optimized variables
             optimizer.zero_grad()
             # forward pass: compute predicted outputs by passing inputs to the model
-            x1train, output = model(data)
+            output = model(data)
             # calculate the batch loss
             loss = criterion(output, target)
             # backward pass: compute gradient of the loss with respect to model parameters
@@ -330,7 +386,7 @@ def train(model, train_loader, valid_loader, criterion, optimizer, train_on_gpu)
             if train_on_gpu:
                 data, target = data.cuda(), target.cuda()
             # forward pass: compute predicted outputs by passing inputs to the model
-            x1valid, output = model(data)
+            output = model(data)
             # calculate the batch loss
             loss = criterion(output, target)
             # update average validation loss 
@@ -356,7 +412,8 @@ def train(model, train_loader, valid_loader, criterion, optimizer, train_on_gpu)
             torch.save(model.state_dict(), 'model_trained.pt')
             valid_loss_min = valid_loss
 
-    return train_losses, valid_losses, x1train, x1valid
+    # Return the values we tracked for data analysis and visualization later
+    return train_losses, valid_losses
 
 ##############################################
 # Test the Trained Model on the Test Dataset #
@@ -367,14 +424,26 @@ def test(model, test_loader, classes, batch_size, criterion, train_on_gpu):
     class_correct = list(0. for i in range(10))
     class_total = list(0. for i in range(10))
 
+    # Code to find top images for 3 filters
+    layer_name = 'conv1'
+    selected_filters = [0, 4, 5]
+    top_k = 5
+    top_images = {f: [] for f in selected_filters}
+
     model.eval()
+
+    # Add hook for analysis
+    layer_modue = getattr(model, layer_name)
+    hook_handle = layer_modue.register_forward_hook(feature_hook(layer_name))
+    cur_index = 0
+
     # iterate over test data
     for batch_idx, (data, target) in enumerate(test_loader):
         # move tensors to GPU if CUDA is available
         if train_on_gpu:
             data, target = data.cuda(), target.cuda()
         # forward pass: compute predicted outputs by passing inputs to the model
-        x1test, output = model(data)
+        output = model(data)
         # calculate the batch loss
         loss = criterion(output, target)
         # update test loss 
@@ -384,11 +453,36 @@ def test(model, test_loader, classes, batch_size, criterion, train_on_gpu):
         # compare predictions to true label
         correct_tensor = pred.eq(target.data.view_as(pred))
         correct = np.squeeze(correct_tensor.numpy()) if not train_on_gpu else np.squeeze(correct_tensor.cpu().numpy())
+
+        current_batch_size = data.size(0)
+
         # calculate test accuracy for each object class
         for i in range(batch_size):
             label = target.data[i]
             class_correct[label] += correct[i].item()
             class_total[label] += 1
+
+        # Remember to apply ReLU for analysis
+        fm = feature_maps[layer_name]
+        fm = F.relu(fm)
+
+        for f in selected_filters:
+            scores = fm[:, f, :, :].amax(dim=(1, 2))
+
+            for i in range(current_batch_size):
+                act = float(scores[i].item())
+                image_tensor = data[i].detach().cpu()
+                label = int(target[i].detach().cpu().item())
+                index = cur_index + i
+
+                top_images[f].append((act, image_tensor, label, index))
+                top_images[f].sort(key=lambda x: x[0], reverse=True)
+                if len(top_images[f]) > top_k:
+                    top_images[f] = top_images[f][:top_k]
+
+        cur_index += current_batch_size
+    
+    hook_handle.remove()
 
     # average test loss
     test_loss = test_loss/len(test_loader.dataset)
@@ -406,6 +500,26 @@ def test(model, test_loader, classes, batch_size, criterion, train_on_gpu):
         100. * np.sum(class_correct) / np.sum(class_total),
         np.sum(class_correct), np.sum(class_total)))
 
+    # Show the data we got for the top images for each filter
+    # ChatGPT used to help with formatting
+    fig = plt.figure(figsize=(15, 8))
+
+    for row, f in enumerate(selected_filters):
+        for col, (act, img_tensor, label, index) in enumerate(top_images[f]):
+            ax = fig.add_subplot(len(selected_filters), top_k, row * top_k + col + 1)
+            img = img_tensor.numpy()
+            img = np.transpose(img, (1, 2, 0)) 
+            img = img / 2 + 0.5
+            img = np.clip(img, 0, 1)
+            ax.imshow(img)
+            ax.axis('off')
+            ax.set_title(f'Act={act:.2f}\n{classes[label]} ch={f}', fontsize=8)
+
+    plt.suptitle(f"Top {top_k} Maximally Activating Images ({layer_name} - Max activation, after ReLU)")
+    plt.tight_layout()
+    plt.show()
+
+
     #################################
     # Visualize Sample Test Results #
     #################################
@@ -420,7 +534,7 @@ def test(model, test_loader, classes, batch_size, criterion, train_on_gpu):
         images = images.cuda()
 
     # get sample outputs
-    x1test, output = model(images)
+    output = model(images)
     # convert output probabilities to predicted class
     _, preds_tensor = torch.max(output, 1)
     preds = np.squeeze(preds_tensor.numpy()) if not train_on_gpu else np.squeeze(preds_tensor.cpu().numpy())
