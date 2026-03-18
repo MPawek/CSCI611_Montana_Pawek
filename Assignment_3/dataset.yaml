@@ -1,0 +1,7 @@
+path: D:/yolo_dataset
+train: images/train
+val: images/val
+test: images/test
+
+names:
+  0: traffic_sign
