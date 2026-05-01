@@ -1,0 +1,21 @@
+{
+  "train": [
+    "CTU-Malware-Capture-Botnet-42",
+    "CTU-Malware-Capture-Botnet-43",
+    "CTU-Malware-Capture-Botnet-44",
+    "CTU-Malware-Capture-Botnet-45",
+    "CTU-Malware-Capture-Botnet-46",
+    "CTU-Malware-Capture-Botnet-47",
+    "CTU-Malware-Capture-Botnet-50",
+    "CTU-Malware-Capture-Botnet-51",
+    "CTU-Malware-Capture-Botnet-52",
+    "CTU-Malware-Capture-Botnet-54"
+  ],
+  "val": [
+    "CTU-Malware-Capture-Botnet-48"
+  ],
+  "test": [
+    "CTU-Malware-Capture-Botnet-49",
+    "CTU-Malware-Capture-Botnet-53"
+  ]
+}

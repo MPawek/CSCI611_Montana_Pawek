@@ -1,0 +1,41 @@
+{
+  "node_feature_names": [
+    "out_degree",
+    "in_degree",
+    "out_flows",
+    "in_flows",
+    "out_bytes",
+    "in_bytes",
+    "out_pkts",
+    "in_pkts",
+    "out_srcbytes",
+    "in_srcbytes",
+    "out_unique_peers",
+    "in_unique_peers",
+    "out_unique_dports",
+    "in_unique_sports",
+    "out_mean_dur",
+    "in_mean_dur",
+    "out_tcp",
+    "out_udp",
+    "out_icmp",
+    "out_other_proto",
+    "in_tcp",
+    "in_udp",
+    "in_icmp",
+    "in_other_proto"
+  ],
+  "edge_feature_names": [
+    "n_flows",
+    "sum_pkts",
+    "sum_bytes",
+    "sum_srcbytes",
+    "mean_dur",
+    "uniq_sports",
+    "uniq_dports",
+    "proto_tcp",
+    "proto_udp",
+    "proto_icmp",
+    "proto_other"
+  ]
+}

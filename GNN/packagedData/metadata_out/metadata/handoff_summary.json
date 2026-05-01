@@ -1,0 +1,64 @@
+{
+  "input_root": "C:\\Users\\Montana\\My Code\\CSCI611_Montana_Pawek\\GNN\\packagedData\\graphs",
+  "output_dir": "C:\\Users\\Montana\\My Code\\CSCI611_Montana_Pawek\\GNN\\packagedData\\metadata_out",
+  "path_mode": "absolute",
+  "master_manifest": "C:\\Users\\Montana\\My Code\\CSCI611_Montana_Pawek\\GNN\\packagedData\\metadata_out\\metadata\\graphs_index_pyg.csv",
+  "dataset_summary": {
+    "num_graphs": 1594,
+    "num_scenarios": 13,
+    "num_families": 7,
+    "graphs_per_family": {
+      "DonBot": 27,
+      "Murlo": 235,
+      "NSIS.ay": 16,
+      "Neris": 189,
+      "Rbot": 917,
+      "Sogou": 5,
+      "Virut": 205
+    },
+    "graphs_per_scenario": {
+      "CTU-Malware-Capture-Botnet-42": 74,
+      "CTU-Malware-Capture-Botnet-43": 52,
+      "CTU-Malware-Capture-Botnet-44": 803,
+      "CTU-Malware-Capture-Botnet-45": 51,
+      "CTU-Malware-Capture-Botnet-46": 7,
+      "CTU-Malware-Capture-Botnet-47": 27,
+      "CTU-Malware-Capture-Botnet-48": 5,
+      "CTU-Malware-Capture-Botnet-49": 235,
+      "CTU-Malware-Capture-Botnet-50": 63,
+      "CTU-Malware-Capture-Botnet-51": 58,
+      "CTU-Malware-Capture-Botnet-52": 5,
+      "CTU-Malware-Capture-Botnet-53": 16,
+      "CTU-Malware-Capture-Botnet-54": 198
+    },
+    "total_labeled_nodes": 9565,
+    "total_positive_nodes": 1766,
+    "total_negative_nodes": 7799,
+    "total_unknown_nodes": 7536304
+  },
+  "fixed_split": {
+    "train_graphs": 1338,
+    "val_graphs": 5,
+    "test_graphs": 251,
+    "train_scenarios": [
+      "CTU-Malware-Capture-Botnet-42",
+      "CTU-Malware-Capture-Botnet-43",
+      "CTU-Malware-Capture-Botnet-44",
+      "CTU-Malware-Capture-Botnet-45",
+      "CTU-Malware-Capture-Botnet-46",
+      "CTU-Malware-Capture-Botnet-47",
+      "CTU-Malware-Capture-Botnet-50",
+      "CTU-Malware-Capture-Botnet-51",
+      "CTU-Malware-Capture-Botnet-52",
+      "CTU-Malware-Capture-Botnet-54"
+    ],
+    "val_scenarios": [
+      "CTU-Malware-Capture-Botnet-48"
+    ],
+    "test_scenarios": [
+      "CTU-Malware-Capture-Botnet-49",
+      "CTU-Malware-Capture-Botnet-53"
+    ],
+    "profile": "balanced"
+  }
+}
