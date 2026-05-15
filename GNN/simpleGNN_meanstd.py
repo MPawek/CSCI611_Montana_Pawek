@@ -1,12 +1,7 @@
-import copy
 import os
-import random
-from itertools import product
 from pathlib import Path
-from statistics import mean, pstdev
-from typing import Dict, List, Tuple
+from typing import List, Tuple
 
-import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
@@ -14,117 +9,68 @@ import torch.nn.functional as F
 
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 from torch_geometric.data import Data
-from torch_geometric.nn import GCNConv
+from torch_geometric.nn import MessagePassing
+from torch_geometric.utils import softmax
 
-
-# Configurations and Hyperparameters
+# Hyperparameters and configurations
 TRAIN_SPLIT = "./packagedData/metadata_out/metadata/split_train.csv"
 VAL_SPLIT = "./packagedData/metadata_out/metadata/split_val.csv"
 TEST_SPLIT = "./packagedData/metadata_out/metadata/split_test.csv"
 
 GRAPH_ROOT = "./packagedData/graphs"
 
-
 HIDDEN_DIM = 32
 DROPOUT = 0.3
-LR = 1e-3
-WEIGHT_DECAY = 1e-4
+LR = 1e-2
+WEIGHT_DECAY = 1e-6
 EPOCHS = 100
-PATIENCE = 20
-THRESHOLD = 0.4
+PATIENCE = 50
 
-# Small validation-based search space. Keep this compact unless you want a longer run.
-HIDDEN_DIM_OPTIONS = [64]
-DROPOUT_OPTIONS = [0.3]
-LR_OPTIONS = [1e-2]
-WEIGHT_DECAY_OPTIONS = [1e-6]
-THRESHOLD_OPTIONS = [0.55]
+# Used only by thresholded versions.
+THRESHOLD = 0.60
 
-# Run multiple seeds for a more stable estimate.
-SEEDS = [7, 13, 21]
-
+# Make sure CUDA is enabled
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-    if hasattr(torch.backends, "cudnn"):
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-
-
-# Initial GNN model with no added features
-class SimpleGCN(nn.Module):
-    def __init__(
-        self,
-        in_channels: int,
-        hidden_dim: int,
-        out_channels: int,
-        dropout: float = 0.3,
-    ):
-        super().__init__()
-        self.dropout = dropout
-
-        self.conv1 = GCNConv(in_channels, hidden_dim)
-        self.conv2 = GCNConv(hidden_dim, hidden_dim)
-        self.classifier = nn.Linear(hidden_dim, out_channels)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        edge_index: torch.Tensor,
-    ) -> torch.Tensor:
-        x = self.conv1(x, edge_index)
-        x = F.relu(x)
-        x = F.dropout(x, p=self.dropout, training=self.training)
-
-        x = self.conv2(x, edge_index)
-        x = F.relu(x)
-        x = F.dropout(x, p=self.dropout, training=self.training)
-
-        logits = self.classifier(x)
-        return logits
-
+HEADS = 4
 
 # CSV Loading
+# Borrowed largely from examples on GitHub
 def load_metadata(csv_path: str) -> pd.DataFrame:
     if not os.path.exists(csv_path):
         raise FileNotFoundError(f"Could not find CSV file: {csv_path}")
 
     df = pd.read_csv(csv_path)
 
-    required_cols = ["graph_relpath"]
-    for col in required_cols:
-        if col not in df.columns:
-            raise ValueError(f"CSV is missing required column: {col}")
+    if "graph_relpath" not in df.columns:
+        raise ValueError("CSV is missing required column: graph_relpath")
 
     return df
 
 
 def resolve_graph_path(graph_root: str, graph_relpath: str) -> str:
-    """
-    Converts a CSV graph_relpath like:
-      CTU-Malware-Capture-Botnet-42\\CTU-Malware-Capture-Botnet-42__20110810_094500.pt
-
-    into a valid local path under GRAPH_ROOT.
-    """
-    relpath = Path(graph_relpath.replace("\\", os.sep))
-    full_path = Path(graph_root) / relpath
-    return str(full_path)
+    relpath = Path(str(graph_relpath).replace("\\", os.sep))
+    return str(Path(graph_root) / relpath)
 
 
-# Data Preprocessing
-def normalize_features(data: Data) -> Data:
+def normalize_node_features(data: Data) -> Data:
     data.x = data.x.float()
 
     x_mean = data.x.mean(dim=0, keepdim=True)
     x_std = data.x.std(dim=0, keepdim=True).clamp_min(1e-6)
     data.x = (data.x - x_mean) / x_std
+
+    return data
+
+
+def normalize_node_and_edge_features(data: Data) -> Data:
+    data = normalize_node_features(data)
+
+    data.edge_attr = data.edge_attr.float()
+    e_mean = data.edge_attr.mean(dim=0, keepdim=True)
+    e_std = data.edge_attr.std(dim=0, keepdim=True).clamp_min(1e-6)
+    data.edge_attr = (data.edge_attr - e_mean) / e_std
 
     return data
 
@@ -137,10 +83,6 @@ def ensure_label_vector(data: Data) -> Data:
 
 
 def add_supervision_mask(data: Data) -> Data:
-    """
-    Use labeled_mask if it exists.
-    Otherwise supervise on all nodes.
-    """
     if hasattr(data, "labeled_mask"):
         data.supervision_mask = data.labeled_mask.bool()
     else:
@@ -155,11 +97,16 @@ def add_supervision_mask(data: Data) -> Data:
 def load_graphs_from_csv(
     csv_path: str,
     graph_root: str,
+    require_edge_attr: bool = False,
 ) -> List[Data]:
     df = load_metadata(csv_path)
 
     graphs = []
     skipped = 0
+
+    required_fields = ["x", "edge_index", "y"]
+    if require_edge_attr:
+        required_fields.append("edge_attr")
 
     for idx, row in df.iterrows():
         graph_path = resolve_graph_path(graph_root, row["graph_relpath"])
@@ -171,26 +118,28 @@ def load_graphs_from_csv(
 
         data = torch.load(graph_path, map_location="cpu", weights_only=False)
 
-        required_fields = ["x", "edge_index", "y"]
         if not all(hasattr(data, field) for field in required_fields):
             print(f"Skipping graph with missing fields: {graph_path}")
             skipped += 1
             continue
 
-        data = normalize_features(data)
+        if require_edge_attr:
+            data = normalize_node_and_edge_features(data)
+        else:
+            data = normalize_node_features(data)
+
         data = ensure_label_vector(data)
         data = add_supervision_mask(data)
 
-        # Keep some metadata for debugging
         data.graph_path = graph_path
         data.csv_row_index = idx
 
         graphs.append(data)
 
     if not graphs:
-        raise ValueError("No usable graphs were loaded from the training CSV.")
+        raise ValueError(f"No usable graphs were loaded from: {csv_path}")
 
-    print(f"Loaded {len(graphs)} graphs from training CSV. Skipped {skipped}.")
+    print(f"Loaded {len(graphs)} graphs from {csv_path}. Skipped {skipped}.")
     return graphs
 
 
@@ -207,16 +156,183 @@ def compute_metrics(y_true: torch.Tensor, y_pred: torch.Tensor) -> dict:
     }
 
 
-def summarize_metric_dicts(metrics_list: List[dict]) -> Dict[str, Tuple[float, float]]:
-    summary = {}
-    metric_names = metrics_list[0].keys()
-    for name in metric_names:
-        values = [metrics[name] for metrics in metrics_list]
-        summary[name] = (mean(values), pstdev(values))
-    return summary
+def infer_num_classes(graphs: List[Data]) -> int:
+    all_labels = []
+
+    for graph in graphs:
+        labels = graph.y[graph.supervision_mask]
+        if labels.numel() > 0:
+            all_labels.append(labels)
+
+    if not all_labels:
+        raise ValueError("Could not infer classes: no supervised labels found.")
+
+    all_labels = torch.cat(all_labels, dim=0)
+    unique_classes = torch.unique(all_labels)
+
+    if unique_classes.numel() < 2:
+        raise ValueError(
+            f"Training data contains fewer than 2 classes: {unique_classes.tolist()}"
+        )
+
+    return int(unique_classes.numel())
 
 
-# Training and Evaluation
+def compute_class_weights(graphs: List[Data], num_classes: int) -> torch.Tensor:
+    all_labels = []
+
+    for graph in graphs:
+        labels = graph.y[graph.supervision_mask]
+        if labels.numel() > 0:
+            all_labels.append(labels)
+
+    all_labels = torch.cat(all_labels, dim=0)
+    class_counts = torch.bincount(all_labels, minlength=num_classes).float()
+
+    class_weights = class_counts.sum() / class_counts.clamp_min(1.0)
+    class_weights = class_weights / class_weights.sum() * num_classes
+
+    return class_weights
+
+
+def print_split_stats(name: str, graphs: List[Data]) -> None:
+    all_labels = []
+
+    for graph in graphs:
+        labels = graph.y[graph.supervision_mask]
+        if labels.numel() > 0:
+            all_labels.append(labels.cpu())
+
+    y = torch.cat(all_labels, dim=0)
+    unique, counts = torch.unique(y, return_counts=True)
+
+    print(f"{name} label distribution:")
+    total = int(counts.sum().item())
+    for cls, count in zip(unique.tolist(), counts.tolist()):
+        print(f"  class {cls}: {count} ({count / total:.4f})")
+    print()
+
+# Edge-Aware Message Passing
+class EdgeAwareGATLayer(MessagePassing):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        edge_dim: int,
+        heads: int = 4,
+        dropout: float = 0.0,
+    ):
+        super().__init__(aggr="add", node_dim=0)
+
+        self.out_channels = out_channels
+        self.heads = heads
+        self.dropout = dropout
+
+        self.node_proj = nn.Linear(in_channels, heads * out_channels, bias=False)
+        self.edge_proj = nn.Linear(edge_dim, heads * out_channels, bias=False)
+
+        self.attn = nn.Parameter(torch.Tensor(heads, 3 * out_channels))
+        self.bias = nn.Parameter(torch.Tensor(heads * out_channels))
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.xavier_uniform_(self.node_proj.weight)
+        nn.init.xavier_uniform_(self.edge_proj.weight)
+        nn.init.xavier_uniform_(self.attn)
+        nn.init.zeros_(self.bias)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_attr: torch.Tensor,
+    ) -> torch.Tensor:
+        x_proj = self.node_proj(x).view(-1, self.heads, self.out_channels)
+        edge_proj = self.edge_proj(edge_attr).view(-1, self.heads, self.out_channels)
+
+        out = self.propagate(
+            edge_index=edge_index,
+            x=x_proj,
+            edge_attr=edge_proj,
+        )
+
+        out = out.reshape(-1, self.heads * self.out_channels)
+        out = out + self.bias
+        return out
+
+    def message(
+        self,
+        x_i: torch.Tensor,
+        x_j: torch.Tensor,
+        edge_attr: torch.Tensor,
+        index: torch.Tensor,
+        ptr,
+        size_i,
+    ) -> torch.Tensor:
+        attn_input = torch.cat([x_i, x_j, edge_attr], dim=-1)
+
+        alpha = (attn_input * self.attn).sum(dim=-1)
+        alpha = F.leaky_relu(alpha, negative_slope=0.2)
+        alpha = softmax(alpha, index=index, ptr=ptr, num_nodes=size_i)
+        alpha = F.dropout(alpha, p=self.dropout, training=self.training)
+
+        msg = x_j + edge_attr
+        return msg * alpha.unsqueeze(-1)
+
+
+# Edge-Aware GNN
+class EdgeAwareGNN(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        edge_dim: int,
+        hidden_dim: int,
+        out_channels: int,
+        heads: int = 4,
+        dropout: float = 0.3,
+    ):
+        super().__init__()
+        self.dropout = dropout
+
+        # Added edge dimensions to each layer
+        self.layer1 = EdgeAwareGATLayer(
+            in_channels=in_channels,
+            out_channels=hidden_dim,
+            edge_dim=edge_dim,
+            heads=heads,
+            dropout=dropout,
+        )
+
+        self.layer2 = EdgeAwareGATLayer(
+            in_channels=hidden_dim * heads,
+            out_channels=hidden_dim,
+            edge_dim=edge_dim,
+            heads=heads,
+            dropout=dropout,
+        )
+
+        self.classifier = nn.Linear(hidden_dim * heads, out_channels)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_attr: torch.Tensor,
+    ) -> torch.Tensor:
+        x = self.layer1(x, edge_index, edge_attr)
+        x = F.elu(x)
+        x = F.dropout(x, p=self.dropout, training=self.training)
+
+        x = self.layer2(x, edge_index, edge_attr)
+        x = F.elu(x)
+        x = F.dropout(x, p=self.dropout, training=self.training)
+
+        logits = self.classifier(x)
+        return logits
+
+
+# Training/Eval
 def train_one_epoch(
     model: nn.Module,
     graphs: List[Data],
@@ -236,7 +352,7 @@ def train_one_epoch(
 
         optimizer.zero_grad()
 
-        logits = model(data.x, data.edge_index)
+        logits = model(data.x, data.edge_index, data.edge_attr)
         loss = criterion(logits[data.supervision_mask], data.y[data.supervision_mask])
 
         loss.backward()
@@ -246,21 +362,22 @@ def train_one_epoch(
         used_graphs += 1
 
     if used_graphs == 0:
-        raise ValueError("No training graphs contained labeled nodes for supervision.")
+        raise ValueError("No usable training graphs were found.")
 
     return total_loss / used_graphs
 
 
 @torch.no_grad()
-def collect_eval_outputs(
+def evaluate_on_graphs(
     model: nn.Module,
     graphs: List[Data],
     criterion: nn.Module,
-) -> Tuple[float, torch.Tensor, torch.Tensor]:
+    threshold: float = THRESHOLD,
+) -> Tuple[float, dict]:
     model.eval()
 
     all_true = []
-    all_probs = []
+    all_pred = []
     total_loss = 0.0
     used_graphs = 0
 
@@ -271,334 +388,167 @@ def collect_eval_outputs(
         if labels.numel() == 0:
             continue
 
-        logits = model(data.x, data.edge_index)
+        logits = model(data.x, data.edge_index, data.edge_attr)
         loss = criterion(logits[data.supervision_mask], data.y[data.supervision_mask])
 
         probs = torch.softmax(logits, dim=1)[:, 1]
+        preds = (probs >= threshold).long()
 
         all_true.append(data.y[data.supervision_mask].cpu())
-        all_probs.append(probs[data.supervision_mask].cpu())
+        all_pred.append(preds[data.supervision_mask].cpu())
 
         total_loss += loss.item()
         used_graphs += 1
 
     if used_graphs == 0:
-        raise ValueError("No evaluation graphs contained labeled nodes for supervision.")
+        raise ValueError("No usable evaluation graphs were found.")
 
     y_true = torch.cat(all_true, dim=0)
-    y_prob = torch.cat(all_probs, dim=0)
-    return total_loss / used_graphs, y_true, y_prob
+    y_pred = torch.cat(all_pred, dim=0)
+
+    metrics = compute_metrics(y_true, y_pred)
+
+    return total_loss / used_graphs, metrics
 
 
-def metrics_from_probs(
-    y_true: torch.Tensor,
-    y_prob: torch.Tensor,
-    threshold: float,
-) -> dict:
-    y_pred = (y_prob >= threshold).long()
-    return compute_metrics(y_true, y_pred)
-
-
+@torch.no_grad()
 def find_best_threshold(
-    y_true: torch.Tensor,
-    y_prob: torch.Tensor,
-    thresholds: List[float],
-) -> Tuple[float, dict]:
-    best_threshold = thresholds[0]
-    best_metrics = metrics_from_probs(y_true, y_prob, best_threshold)
+    model: nn.Module,
+    graphs: List[Data],
+) -> Tuple[float, float]:
+    model.eval()
 
-    for threshold in thresholds[1:]:
-        metrics = metrics_from_probs(y_true, y_prob, threshold)
-        if metrics["f1"] > best_metrics["f1"]:
+    all_true = []
+    all_probs = []
+
+    for data in graphs:
+        data = data.to(DEVICE)
+
+        labels = data.y[data.supervision_mask]
+        if labels.numel() == 0:
+            continue
+
+        logits = model(data.x, data.edge_index, data.edge_attr)
+        probs = torch.softmax(logits, dim=1)[:, 1]
+
+        all_true.append(data.y[data.supervision_mask].cpu())
+        all_probs.append(probs[data.supervision_mask].cpu())
+
+    y_true = torch.cat(all_true).numpy()
+    y_prob = torch.cat(all_probs).numpy()
+
+    best_threshold = 0.5
+    best_f1 = -1.0
+
+    for threshold in [i / 100 for i in range(10, 91, 5)]:
+        y_pred = (y_prob >= threshold).astype(int)
+        score = f1_score(y_true, y_pred, zero_division=0)
+
+        if score > best_f1:
+            best_f1 = score
             best_threshold = threshold
-            best_metrics = metrics
 
-    return best_threshold, best_metrics
-
-
-def build_model_and_training_objects(
-    in_channels: int,
-    num_classes: int,
-    all_labels: torch.Tensor,
-    hidden_dim: int,
-    dropout: float,
-    lr: float,
-    weight_decay: float,
-) -> Tuple[nn.Module, nn.Module, torch.optim.Optimizer]:
-    model = SimpleGCN(
-        in_channels=in_channels,
-        hidden_dim=hidden_dim,
-        out_channels=num_classes,
-        dropout=dropout,
-    ).to(DEVICE)
-
-    class_counts = torch.bincount(all_labels, minlength=num_classes).float()
-    class_weights = class_counts.sum() / class_counts.clamp_min(1.0)
-    class_weights = class_weights / class_weights.sum() * num_classes
-    class_weights = class_weights.to(DEVICE)
-
-    criterion = nn.CrossEntropyLoss(weight=class_weights)
-    optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=lr,
-        weight_decay=weight_decay,
-    )
-
-    return model, criterion, optimizer
-
-
-def train_and_select_model(
-    train_graphs: List[Data],
-    val_graphs: List[Data],
-    in_channels: int,
-    num_classes: int,
-    all_labels: torch.Tensor,
-    hidden_dim: int,
-    dropout: float,
-    lr: float,
-    weight_decay: float,
-    verbose: bool = True,
-) -> Tuple[nn.Module, nn.Module, float, dict, float]:
-    model, criterion, optimizer = build_model_and_training_objects(
-        in_channels=in_channels,
-        num_classes=num_classes,
-        all_labels=all_labels,
-        hidden_dim=hidden_dim,
-        dropout=dropout,
-        lr=lr,
-        weight_decay=weight_decay,
-    )
-
-    best_val_loss = float("inf")
-    best_state = None
-    patience_counter = 0
-
-    for epoch in range(1, EPOCHS + 1):
-        train_loss = train_one_epoch(model, train_graphs, optimizer, criterion)
-        val_loss, val_y_true, val_y_prob = collect_eval_outputs(model, val_graphs, criterion)
-        current_threshold, current_metrics = find_best_threshold(
-            val_y_true,
-            val_y_prob,
-            THRESHOLD_OPTIONS,
-        )
-
-        if verbose and (epoch == 1 or epoch % 5 == 0):
-            print(
-                f"Epoch {epoch:03d} | "
-                f"Train Loss: {train_loss:.4f} | "
-                f"Val Loss: {val_loss:.4f} | "
-                f"Val Thr: {current_threshold:.2f} | "
-                f"Val F1: {current_metrics['f1']:.4f}"
-            )
-
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_state = copy.deepcopy(model.state_dict())
-            patience_counter = 0
-        else:
-            patience_counter += 1
-
-        if patience_counter >= PATIENCE:
-            if verbose:
-                print(f"Early stopping at epoch {epoch}")
-            break
-
-    if best_state is not None:
-        model.load_state_dict(best_state)
-
-    final_val_loss, val_y_true, val_y_prob = collect_eval_outputs(model, val_graphs, criterion)
-    best_threshold, best_val_metrics = find_best_threshold(val_y_true, val_y_prob, THRESHOLD_OPTIONS)
-
-    return model, criterion, best_threshold, best_val_metrics, final_val_loss
-
-
-def run_hyperparameter_search(
-    train_graphs: List[Data],
-    val_graphs: List[Data],
-    in_channels: int,
-    num_classes: int,
-    all_labels: torch.Tensor,
-    seed: int,
-) -> Tuple[nn.Module, nn.Module, float, Dict[str, float], dict, float]:
-    best_model = None
-    best_criterion = None
-    best_threshold = THRESHOLD
-    best_config = None
-    best_val_metrics = None
-    best_val_loss = None
-    best_val_f1 = -1.0
-
-    search_space = list(
-        product(
-            HIDDEN_DIM_OPTIONS,
-            DROPOUT_OPTIONS,
-            LR_OPTIONS,
-            WEIGHT_DECAY_OPTIONS,
-        )
-    )
-
-    print(f"\nSeed {seed} | Running {len(search_space)} validation trials...")
-
-    for trial_idx, (hidden_dim, dropout, lr, weight_decay) in enumerate(search_space, start=1):
-        set_seed(seed)
-        print(
-            f"\nSeed {seed} | Trial {trial_idx:02d}/{len(search_space)} | "
-            f"hidden_dim={hidden_dim}, dropout={dropout}, lr={lr}, weight_decay={weight_decay}"
-        )
-
-        model, criterion, threshold, val_metrics, val_loss = train_and_select_model(
-            train_graphs=train_graphs,
-            val_graphs=val_graphs,
-            in_channels=in_channels,
-            num_classes=num_classes,
-            all_labels=all_labels,
-            hidden_dim=hidden_dim,
-            dropout=dropout,
-            lr=lr,
-            weight_decay=weight_decay,
-            verbose=False,
-        )
-
-        print(
-            f"Trial result | Val Loss: {val_loss:.4f} | "
-            f"Val Threshold: {threshold:.2f} | "
-            f"Val Accuracy: {val_metrics['accuracy']:.4f} | "
-            f"Val Precision: {val_metrics['precision']:.4f} | "
-            f"Val Recall: {val_metrics['recall']:.4f} | "
-            f"Val F1: {val_metrics['f1']:.4f}"
-        )
-
-        if val_metrics["f1"] > best_val_f1:
-            best_val_f1 = val_metrics["f1"]
-            best_model = copy.deepcopy(model)
-            best_criterion = criterion
-            best_threshold = threshold
-            best_config = {
-                "hidden_dim": hidden_dim,
-                "dropout": dropout,
-                "lr": lr,
-                "weight_decay": weight_decay,
-            }
-            best_val_metrics = val_metrics
-            best_val_loss = val_loss
-
-    return best_model, best_criterion, best_threshold, best_config, best_val_metrics, best_val_loss
-
-
-def run_single_seed(
-    train_graphs: List[Data],
-    val_graphs: List[Data],
-    test_graphs: List[Data],
-    in_channels: int,
-    num_classes: int,
-    all_labels: torch.Tensor,
-    seed: int,
-) -> dict:
-    set_seed(seed)
-
-    best_model, best_criterion, best_threshold, best_config, best_val_metrics, best_val_loss = run_hyperparameter_search(
-        train_graphs=train_graphs,
-        val_graphs=val_graphs,
-        in_channels=in_channels,
-        num_classes=num_classes,
-        all_labels=all_labels,
-        seed=seed,
-    )
-
-    test_loss, test_y_true, test_y_prob = collect_eval_outputs(best_model, test_graphs, best_criterion)
-    test_metrics = metrics_from_probs(test_y_true, test_y_prob, best_threshold)
-
-    return {
-        "seed": seed,
-        "best_config": best_config,
-        "best_threshold": best_threshold,
-        "val_loss": best_val_loss,
-        "val_metrics": best_val_metrics,
-        "test_loss": test_loss,
-        "test_metrics": test_metrics,
-    }
+    return best_threshold, best_f1
 
 
 # Main
 def main():
-    train_graphs = load_graphs_from_csv(TRAIN_SPLIT, GRAPH_ROOT)
-    val_graphs = load_graphs_from_csv(VAL_SPLIT, GRAPH_ROOT)
-    test_graphs = load_graphs_from_csv(TEST_SPLIT, GRAPH_ROOT)
+    train_graphs = load_graphs_from_csv(TRAIN_SPLIT, GRAPH_ROOT, require_edge_attr=True)
+    val_graphs = load_graphs_from_csv(VAL_SPLIT, GRAPH_ROOT, require_edge_attr=True)
+    test_graphs = load_graphs_from_csv(TEST_SPLIT, GRAPH_ROOT, require_edge_attr=True)
 
-    first_graph = train_graphs[0]
-    in_channels = first_graph.x.size(1)
+    # Debug prints
+    print_split_stats("Train", train_graphs)
+    print_split_stats("Validation", val_graphs)
+    print_split_stats("Test", test_graphs)
 
-    all_labels = []
-    for g in train_graphs:
-        all_labels.append(g.y[g.supervision_mask])
-    all_labels = torch.cat(all_labels, dim=0)
+    in_channels = train_graphs[0].x.size(1)
+    edge_dim = train_graphs[0].edge_attr.size(1)
+    num_classes = infer_num_classes(train_graphs)
 
-    print("Unique training labels:", torch.unique(all_labels).tolist())
+    model = EdgeAwareGNN(
+        in_channels=in_channels,
+        edge_dim=edge_dim,
+        hidden_dim=HIDDEN_DIM,
+        out_channels=num_classes,
+        heads=HEADS,
+        dropout=DROPOUT,
+    ).to(DEVICE)
 
-    unique_classes = torch.unique(all_labels)
-    num_classes = int(unique_classes.numel())
+    class_weights = compute_class_weights(train_graphs, num_classes).to(DEVICE)
 
-    if num_classes < 2:
-        raise ValueError(
-            f"All graphs together still contain fewer than 2 classes: {unique_classes.tolist()}"
-        )
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=LR,
+        weight_decay=WEIGHT_DECAY,
+    )
+
+    best_val_f1 = -1.0
+    best_state = None
+    best_epoch = -1
+    patience_counter = 0
 
     print(f"Using device: {DEVICE}")
     print(f"Train graphs: {len(train_graphs)}")
     print(f"Val graphs:   {len(val_graphs)}")
     print(f"Test graphs:  {len(test_graphs)}")
     print(f"Input dim:    {in_channels}")
+    print(f"Edge dim:     {edge_dim}")
     print(f"Num classes:  {num_classes}")
-    print(f"Seeds:        {SEEDS}")
+    print(f"Heads:        {HEADS}")
+    print(f"Default threshold: {THRESHOLD}")
     print()
 
-    run_results = []
-    for seed in SEEDS:
-        result = run_single_seed(
-            train_graphs=train_graphs,
-            val_graphs=val_graphs,
-            test_graphs=test_graphs,
-            in_channels=in_channels,
-            num_classes=num_classes,
-            all_labels=all_labels,
-            seed=seed,
-        )
-        run_results.append(result)
+    for epoch in range(1, EPOCHS + 1):
+        train_loss = train_one_epoch(model, train_graphs, optimizer, criterion)
+        val_loss, val_metrics = evaluate_on_graphs(model, val_graphs, criterion, threshold=THRESHOLD)
 
-        print(f"\nSeed {seed} summary")
-        print(f"Best validation config: {result['best_config']}")
-        print(f"Best validation threshold: {result['best_threshold']:.2f}")
-        print(f"Validation loss: {result['val_loss']:.4f}")
-        print(f"Validation F1:   {result['val_metrics']['f1']:.4f}")
-        print(f"Test loss:       {result['test_loss']:.4f}")
-        print(f"Test accuracy:   {result['test_metrics']['accuracy']:.4f}")
-        print(f"Test precision:  {result['test_metrics']['precision']:.4f}")
-        print(f"Test recall:     {result['test_metrics']['recall']:.4f}")
-        print(f"Test F1:         {result['test_metrics']['f1']:.4f}")
+        if epoch == 1 or epoch % 5 == 0:
+            print(
+                f"Epoch {epoch:03d} | "
+                f"Train Loss: {train_loss:.4f} | "
+                f"Val Loss: {val_loss:.4f} | "
+                f"Val Acc: {val_metrics['accuracy']:.4f} | "
+                f"Val Prec: {val_metrics['precision']:.4f} | "
+                f"Val Rec: {val_metrics['recall']:.4f} | "
+                f"Val F1: {val_metrics['f1']:.4f}"
+            )
 
-    test_metric_summary = summarize_metric_dicts([result["test_metrics"] for result in run_results])
-    test_losses = [result["test_loss"] for result in run_results]
-    thresholds = [result["best_threshold"] for result in run_results]
+        if val_metrics["f1"] > best_val_f1:
+            best_val_f1 = val_metrics["f1"]
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            best_epoch = epoch
+            patience_counter = 0
+        else:
+            patience_counter += 1
 
-    print("\nFinal Test Results Across Seeds")
-    print(f"Threshold mean +/- std: {mean(thresholds):.4f} +/- {pstdev(thresholds):.4f}")
-    print(f"Test Loss mean +/- std: {mean(test_losses):.4f} +/- {pstdev(test_losses):.4f}")
-    print(
-        f"Test Accuracy mean +/- std: {test_metric_summary['accuracy'][0]:.4f} +/- "
-        f"{test_metric_summary['accuracy'][1]:.4f}"
+        if patience_counter >= PATIENCE:
+            print(f"\nEarly stopping at epoch {epoch}")
+            break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    best_threshold, threshold_val_f1 = find_best_threshold(model, val_graphs)
+
+    print(f"Best validation F1 during training: {best_val_f1:.4f} at epoch {best_epoch}")
+    print(f"Best threshold from validation sweep: {best_threshold:.2f}")
+    print(f"Validation F1 at best threshold: {threshold_val_f1:.4f}")
+
+    test_loss, test_metrics = evaluate_on_graphs(
+        model,
+        test_graphs,
+        criterion,
+        threshold=best_threshold,
     )
-    print(
-        f"Test Precision mean +/- std: {test_metric_summary['precision'][0]:.4f} +/- "
-        f"{test_metric_summary['precision'][1]:.4f}"
-    )
-    print(
-        f"Test Recall mean +/- std: {test_metric_summary['recall'][0]:.4f} +/- "
-        f"{test_metric_summary['recall'][1]:.4f}"
-    )
-    print(
-        f"Test F1 mean +/- std: {test_metric_summary['f1'][0]:.4f} +/- "
-        f"{test_metric_summary['f1'][1]:.4f}"
-    )
+
+    print("\nFinal Test Results")
+    print(f"Test Loss:      {test_loss:.4f}")
+    print(f"Test Accuracy:  {test_metrics['accuracy']:.4f}")
+    print(f"Test Precision: {test_metrics['precision']:.4f}")
+    print(f"Test Recall:    {test_metrics['recall']:.4f}")
+    print(f"Test F1:        {test_metrics['f1']:.4f}")
 
 
 if __name__ == "__main__":
