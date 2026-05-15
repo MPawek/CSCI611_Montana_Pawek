@@ -54,12 +54,20 @@ TEST_SPLIT = "./packagedData/metadata_out/metadata/split_test.csv"
 
 GRAPH_ROOT = "./packagedData/graphs"
 
+# Initial values
+# Hidden Dimensions: 32
+# Dropout 0.3
+# Learning Rate: 1e-3
+# Weight Decay: 1e-4
+# Epochs: 100
+# Patience: 10
+
 HIDDEN_DIM = 32
 DROPOUT = 0.3
-LR = 1e-4
-WEIGHT_DECAY = 1e-4
+LR = 1e-2
+WEIGHT_DECAY = 1e-6
 EPOCHS = 100
-PATIENCE = 10
+PATIENCE = 50
 
 # Cuda is necessary for improving training time
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
