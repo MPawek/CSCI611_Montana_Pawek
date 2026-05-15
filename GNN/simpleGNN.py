@@ -25,9 +25,10 @@ DROPOUT = 0.3
 LR = 1e-2
 WEIGHT_DECAY = 1e-6
 EPOCHS = 100
-PATIENCE = 20
-THRESHOLD = 0.50
+PATIENCE = 50
+THRESHOLD = 0.60
 
+# Remember to make sure CUDA is working
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
